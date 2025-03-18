@@ -13,6 +13,9 @@ from typing import Optional, List, Dict, Any
 from azure.storage.blob import BlobServiceClient
 import logging
 import json
+import requests
+import re
+import math
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -62,6 +65,10 @@ class TranscriptionResponse(BaseModel):
     transcription_data: Optional[TranscriptionData] = None
     is_complete: bool = False  # Field to indicate if processing is complete
 
+class TranscriptionURLRequest(BaseModel):
+    transcription_url: str
+    segment_length: int = 15  # Default segment length in seconds
+
 # Database connection
 def get_db_connection():
     try:
@@ -82,6 +89,12 @@ blob_service_client = BlobServiceClient.from_connection_string(
     os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 )
 container_name = os.getenv("AZURE_BLOB_CONTAINER_NAME")
+
+def format_timestamp(seconds):
+    """Format seconds into MM:SS timestamp"""
+    minutes = int(seconds / 60)
+    remaining_seconds = int(seconds % 60)
+    return f"{minutes:02d}:{remaining_seconds:02d}"
 
 # API Endpoints
 @app.get("/api/health")
@@ -291,6 +304,121 @@ async def delete_transcription(request_id: str):
     finally:
         cursor.close()
         connection.close()
+
+@app.post("/api/process-transcription")
+async def process_transcription(request: TranscriptionURLRequest):
+    """Process the transcription text file from the given URL and return it in structured JSON format with time segments"""
+    try:
+        # Download the transcription text from the provided URL
+        response = requests.get(request.transcription_url)
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to download transcription file. Status code: {response.status_code}"
+            )
+        
+        # Get the raw text
+        raw_text = response.text.strip()
+        
+        # Check if the raw text already contains timestamps
+        timestamp_pattern = re.compile(r'^(\d+:\d+)')
+        has_timestamps = any(timestamp_pattern.match(line.strip()) for line in raw_text.split('\n') if line.strip())
+        
+        segments = []
+        
+        if has_timestamps:
+            # If the text already has timestamps, parse them
+            lines = raw_text.split('\n')
+            current_segment = None
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Check if line starts with a timestamp
+                timestamp_match = timestamp_pattern.match(line)
+                
+                if timestamp_match:
+                    # If we found a timestamp, start a new segment
+                    timestamp = timestamp_match.group(1)
+                    
+                    # Split the line to separate timestamp and text
+                    parts = line.split(' ', 1)
+                    
+                    # Extract text content (if any)
+                    text = parts[1].strip() if len(parts) > 1 else ""
+                    
+                    # Convert timestamp to seconds
+                    try:
+                        minutes, seconds = map(int, timestamp.split(':'))
+                        start_seconds = minutes * 60 + seconds
+                    except ValueError:
+                        # Handle invalid timestamp format
+                        logger.warning(f"Invalid timestamp format: {timestamp}")
+                        start_seconds = 0
+                    
+                    # Add the previous segment if it exists
+                    if current_segment:
+                        segments.append(current_segment)
+                    
+                    # Create new segment
+                    current_segment = {
+                        "timestamp": timestamp,
+                        "text": text,
+                        "start_seconds": start_seconds
+                    }
+                elif current_segment:
+                    # If no timestamp but we have a current segment, append this text to it
+                    current_segment["text"] += " " + line
+            
+            # Add the last segment if it exists
+            if current_segment:
+                segments.append(current_segment)
+        else:
+            # If no timestamps, create segments based on word count or character count
+            # We'll divide the text into segments of specified length
+            segment_length = request.segment_length  # seconds per segment
+            words = raw_text.split()
+            
+            # Estimate video length based on word count (average speaking rate)
+            # Assuming average speaking rate of ~150 words per minute or 2.5 words per second
+            estimated_total_seconds = len(words) / 2.5
+            
+            # Calculate how many words per segment based on our segment_length
+            words_per_segment = math.ceil(2.5 * segment_length)
+            
+            # Create segments
+            for i in range(0, len(words), words_per_segment):
+                segment_words = words[i:i+words_per_segment]
+                segment_text = " ".join(segment_words)
+                
+                start_seconds = int((i / 2.5) // segment_length * segment_length)
+                timestamp = format_timestamp(start_seconds)
+                
+                segments.append({
+                    "timestamp": timestamp,
+                    "text": segment_text,
+                    "start_seconds": start_seconds
+                })
+        
+        # If no segments were created (which should be rare), create a default one
+        if not segments:
+            segments.append({
+                "timestamp": "00:00",
+                "text": raw_text,
+                "start_seconds": 0
+            })
+        
+        return {"segments": segments}
+        
+    except requests.RequestException as e:
+        logger.error(f"Request error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to download transcription: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error processing transcription: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing transcription: {str(e)}")
 
 def start_server():
     """Start the FastAPI server"""
