@@ -484,7 +484,7 @@ def start_server():
     import uvicorn
     uvicorn.run(
         "checkServer:app",
-        host=host,
+        host="0.0.0.0",
         port=port,
         log_level="info",
         reload=True
