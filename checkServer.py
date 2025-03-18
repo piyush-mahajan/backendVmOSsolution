@@ -57,6 +57,7 @@ class TranscriptionSegment(BaseModel):
 
 class TranscriptionData(BaseModel):
     segments: List[TranscriptionSegment]
+    full_text: Optional[str] = None  # New field for the complete transcript
 
 class TranscriptionResponse(BaseModel):
     request_id: str
@@ -160,12 +161,29 @@ async def get_transcription_status(request_id: str):
                     existing_data = json.loads(result["transcription_text"])
                     if "segments" in existing_data:
                         transcription_data = existing_data
+                        
+                        # Add full_text if it doesn't exist
+                        if "full_text" not in existing_data:
+                            # Generate full text from segments
+                            full_text = ""
+                            for segment in existing_data["segments"]:
+                                timestamp = segment.get("timestamp", "00:00")
+                                text = segment.get("text", "")
+                                full_text += f"[{timestamp}] {text} "
+                            
+                            transcription_data["full_text"] = full_text.strip()
+                            
+                            # Update in DB
+                            update_query = "UPDATE requests SET transcription_text = %s WHERE request_id = %s"
+                            cursor.execute(update_query, (json.dumps(transcription_data), request_id))
+                            connection.commit()
                 except json.JSONDecodeError:
                     # It's a plain text, so parse and convert to JSON
                     segments = []
                     lines = result["transcription_text"].strip().split("\n")
                     
                     current_segment = {"timestamp": "00:00", "text": "", "start_seconds": 0}
+                    full_text = ""
                     
                     for line in lines:
                         # Simple parsing logic - this might need adjustment based on your text format
@@ -179,6 +197,9 @@ async def get_transcription_status(request_id: str):
                             timestamp = parts[0]
                             text = parts[1] if len(parts) > 1 else ""
                             
+                            # Add to full text
+                            full_text += f"[{timestamp}] {text} "
+                            
                             # Convert timestamp to seconds
                             minutes, seconds = map(int, timestamp.split(":"))
                             start_seconds = minutes * 60 + seconds
@@ -191,12 +212,16 @@ async def get_transcription_status(request_id: str):
                         elif line.strip():
                             # Append to current segment text
                             current_segment["text"] += " " + line.strip()
+                            full_text += line.strip() + " "
                     
                     # Add the last segment
                     if current_segment["text"]:
                         segments.append(current_segment)
                     
-                    transcription_data = {"segments": segments}
+                    transcription_data = {
+                        "segments": segments,
+                        "full_text": full_text.strip()
+                    }
                     
                     # Update the database with the JSON format
                     update_query = "UPDATE requests SET transcription_text = %s WHERE request_id = %s"
@@ -251,6 +276,20 @@ async def list_transcriptions(email: Optional[str] = None, skip: int = 0, limit:
                     # Try to parse JSON data
                     json_data = json.loads(result["transcription_text"])
                     if "segments" in json_data:
+                        # Ensure full_text exists
+                        if "full_text" not in json_data:
+                            full_text = ""
+                            for segment in json_data["segments"]:
+                                timestamp = segment.get("timestamp", "00:00")
+                                text = segment.get("text", "")
+                                full_text += f"[{timestamp}] {text} "
+                            json_data["full_text"] = full_text.strip()
+                            
+                            # Update in DB
+                            update_query = "UPDATE requests SET transcription_text = %s WHERE request_id = %s"
+                            cursor.execute(update_query, (json.dumps(json_data), result["request_id"]))
+                            connection.commit()
+                        
                         transcription_data = json_data
                 except:
                     # If it's not JSON, leave as None - we'll convert it when requested directly
@@ -326,6 +365,7 @@ async def process_transcription(request: TranscriptionURLRequest):
         has_timestamps = any(timestamp_pattern.match(line.strip()) for line in raw_text.split('\n') if line.strip())
         
         segments = []
+        full_text = ""  # Initialize full_text
         
         if has_timestamps:
             # If the text already has timestamps, parse them
@@ -350,6 +390,9 @@ async def process_transcription(request: TranscriptionURLRequest):
                     # Extract text content (if any)
                     text = parts[1].strip() if len(parts) > 1 else ""
                     
+                    # Add to full text
+                    full_text += f"[{timestamp}] {text} "
+                    
                     # Convert timestamp to seconds
                     try:
                         minutes, seconds = map(int, timestamp.split(':'))
@@ -372,6 +415,7 @@ async def process_transcription(request: TranscriptionURLRequest):
                 elif current_segment:
                     # If no timestamp but we have a current segment, append this text to it
                     current_segment["text"] += " " + line
+                    full_text += line + " "
             
             # Add the last segment if it exists
             if current_segment:
@@ -381,6 +425,9 @@ async def process_transcription(request: TranscriptionURLRequest):
             # We'll divide the text into segments of specified length
             segment_length = request.segment_length  # seconds per segment
             words = raw_text.split()
+            
+            # Store the full text
+            full_text = raw_text
             
             # Estimate video length based on word count (average speaking rate)
             # Assuming average speaking rate of ~150 words per minute or 2.5 words per second
@@ -410,8 +457,16 @@ async def process_transcription(request: TranscriptionURLRequest):
                 "text": raw_text,
                 "start_seconds": 0
             })
+            full_text = raw_text
         
-        return {"segments": segments}
+        # Ensure full_text is properly formatted
+        if not full_text:
+            full_text = " ".join([f"[{s['timestamp']}] {s['text']}" for s in segments])
+        
+        return {
+            "segments": segments,
+            "full_text": full_text.strip()
+        }
         
     except requests.RequestException as e:
         logger.error(f"Request error: {str(e)}")
